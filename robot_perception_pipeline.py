@@ -1,198 +1,197 @@
 """
-Robot Perception Pipeline (Webcam + YOLOv8 + ByteTrack + Motion Attention + Kalman Prediction)
------------------------------------------------------------------------------------------------
-- Records webcam clips into timestamped videos
-- Runs YOLOv8 + ByteTrack tracking
-- Extracts trajectories (dx, dy, speed)
-- Applies a simple Kalman predictor for motion anticipation
-- Saves all outputs under ~/robot_dataset/
+Unified Robot Perception Pipeline (YOLOv8 + ByteTrack + Kalman Prediction)
+--------------------------------------------------------------------------
+- Real-time detection, tracking, and prediction from webcam
+- Draws YOLOv8 boxes (green) and Kalman predicted points (red)
+- Fixes inconsistent ID issue via tuned ByteTrack parameters
+- Restricts to 'person' class only for stability
+- Lets user name each recording and set duration
+- Saves ONE continuous annotated video and ONE CSV log per run
+- Auto-opens folder after saving
+- Output folder: C:/Users/Vijaya Sunder/robot_dataset/
 """
 
 import cv2
 import os
-import time
-import glob
 import csv
+import time
 import numpy as np
-import pandas as pd
+import re
+import subprocess
+import yaml
 from datetime import datetime
 from ultralytics import YOLO
 
 # ---------- CONFIGURATION ----------
-BASE_DIR = os.path.expanduser("~/robot_dataset")
-RAW_DIR = os.path.join(BASE_DIR, "raw_videos")
-TRACK_DIR = os.path.join(BASE_DIR, "tracked_csv")
-TRAJ_DIR = os.path.join(BASE_DIR, "trajectories")
+BASE_DIR = os.path.expanduser(r"C:\Users\Vijaya Sunder\robot_dataset")
+os.makedirs(BASE_DIR, exist_ok=True)
 
-# Ensure base folders exist
-for d in [RAW_DIR, TRACK_DIR, TRAJ_DIR]:
-    os.makedirs(d, exist_ok=True)
+# Path to ByteTrack YAML (adjust if installed elsewhere)
+TRACKER_YAML = "bytetrack.yaml"
 
-# ---------- HELPER FUNCTIONS ----------
-def record_video(session: str, duration: int = 30):
-    """Record a short webcam clip with timestamped filename."""
-    session_dir = os.path.join(RAW_DIR, session)
-    os.makedirs(session_dir, exist_ok=True)
+# ---------- UPDATE BYTE TRACK CONFIG ----------
+def update_tracker_config():
+    """Tune ByteTrack parameters to improve ID persistence."""
+    if not os.path.exists(TRACKER_YAML):
+        print("⚠️ Warning: bytetrack.yaml not found. Proceeding with defaults.")
+        return
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    video_path = os.path.join(session_dir, f"scene_{ts}.mp4")
+    with open(TRACKER_YAML, "r") as f:
+        config = yaml.safe_load(f)
+
+    # Make ID matching more stable
+    config["track_high_thresh"] = 0.3      # keep detections even if lower confidence
+    config["track_low_thresh"] = 0.1
+    config["match_thresh"] = 0.75          # stronger frame-to-frame association
+    config["track_buffer"] = 100           # remember lost IDs longer
+
+    with open(TRACKER_YAML, "w") as f:
+        yaml.safe_dump(config, f)
+
+    print("✅ ByteTrack parameters updated for persistent IDs.")
+
+# ---------- KALMAN FILTER CLASS ----------
+class Kalman2D:
+    def __init__(self):
+        self.kf = cv2.KalmanFilter(4, 2)
+        self.kf.transitionMatrix = np.array(
+            [[1, 0, 1, 0],
+             [0, 1, 0, 1],
+             [0, 0, 1, 0],
+             [0, 0, 0, 1]], np.float32)
+        self.kf.measurementMatrix = np.eye(2, 4, dtype=np.float32)
+        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 1e-2
+        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1e-1
+        self.initialized = False
+
+    def update(self, x, y):
+        if not self.initialized:
+            self.kf.statePre = np.array([[x], [y], [0], [0]], np.float32)
+            self.initialized = True
+        measurement = np.array([[np.float32(x)], [np.float32(y)]])
+        self.kf.correct(measurement)
+
+    def predict(self):
+        pred = self.kf.predict()
+        return float(pred[0].item()), float(pred[1].item())
+
+# ---------- SAFE INPUT ----------
+def get_numeric_input(prompt, default=30):
+    raw = input(prompt).strip()
+    if not raw:
+        return default
+    digits = re.findall(r"\d+", raw)
+    return int(digits[0]) if digits else default
+
+# ---------- MAIN FUNCTION ----------
+def main():
+    print("🚀 Starting Unified YOLOv8 + ByteTrack + Kalman Prediction Pipeline")
+
+    # Tune ByteTrack config for stable ID tracking
+    update_tracker_config()
+
+    # --- User input ---
+    session_name = input("Enter video session name (e.g., 'lab_test_01'): ").strip()
+    if not session_name:
+        session_name = datetime.now().strftime("session_%Y%m%d_%H%M%S")
+
+    duration = get_numeric_input("Enter recording duration (seconds): ", 30)
+
+    video_path = os.path.join(BASE_DIR, f"{session_name}.avi")
+    csv_path = os.path.join(BASE_DIR, f"{session_name}_log.csv")
+
+    print(f"\n🎥 Recording '{session_name}' for {duration} seconds...")
+    print("Press 'q' to stop early.\n")
+
+    model = YOLO("yolov8n.pt")
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        raise RuntimeError("Webcam not detected")
+        raise RuntimeError("Error: Could not open webcam.")
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps == 0 or np.isnan(fps):
         fps = 30.0
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    out = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
 
-    print(f"\n🎥 Recording {duration}s → {video_path}")
-    start = time.time()
+    # Use XVID codec for better Windows compatibility
+    fourcc = cv2.VideoWriter_fourcc(*"XVID")
+    out = cv2.VideoWriter(video_path, fourcc, fps, (width, height))
+
+    csv_file = open(csv_path, "w", newline="")
+    writer = csv.writer(csv_file)
+    writer.writerow(["frame", "track_id", "class", "x1", "y1", "x2", "y2", "x_pred", "y_pred"])
+
+    kalman_filters = {}
+    frame_idx = 0
+    start_time = time.time()
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
+        frame_idx += 1
+        elapsed = time.time() - start_time
+        if elapsed >= duration:
+            print(f"⏰ Duration reached ({duration}s). Stopping automatically.")
+            break
+
+        # --- YOLOv8 + ByteTrack (person class only) ---
+        results = model.track(frame, persist=True, tracker=TRACKER_YAML, classes=[0], verbose=False)
+        if results and results[0].boxes is not None and results[0].boxes.id is not None:
+            for xyxy, cls, tid in zip(results[0].boxes.xyxy, results[0].boxes.cls, results[0].boxes.id):
+                x1, y1, x2, y2 = map(int, xyxy)
+                cname = model.names[int(cls)]
+                cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
+
+                # Kalman prediction per tracked ID
+                if tid not in kalman_filters:
+                    kalman_filters[tid] = Kalman2D()
+                kalman_filters[tid].update(cx, cy)
+                px, py = kalman_filters[tid].predict()
+
+                # Draw detection + prediction
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(frame, f"ID {int(tid)} ({cname})",
+                            (x1, max(y1 - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6, (0, 255, 0), 2)
+                cv2.circle(frame, (int(px), int(py)), 5, (0, 0, 255), -1)
+                cv2.putText(frame, "Pred", (int(px) + 5, int(py)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+
+                writer.writerow([frame_idx, int(tid), cname, x1, y1, x2, y2, int(px), int(py)])
+                csv_file.flush()
+
+        # Overlay info
+        fps_live = frame_idx / (elapsed + 1e-6)
+        cv2.putText(frame, f"FPS: {fps_live:.1f}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        cv2.putText(frame, f"Time: {elapsed:.1f}s / {duration}s", (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
         out.write(frame)
-        cv2.imshow("Recording (Press Q to stop)", frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-        if time.time() - start > duration:
+        cv2.imshow(f"Recording: {session_name}", frame)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            print("🛑 User stopped recording.")
             break
 
-    cap.release()
+    # --- Safe finalize ---
+    print("🧹 Finalizing video...")
+    time.sleep(0.5)
     out.release()
-    cv2.destroyAllWindows()
-    print("✅ Saved:", video_path)
-    return video_path
-
-
-def track_with_bytetrack(video_path: str, session: str, motion_gate=False):
-    """Run YOLOv8 + ByteTrack on a video, optionally gated by motion detection."""
-    session_dir = os.path.join(TRACK_DIR, session)
-    os.makedirs(session_dir, exist_ok=True)
-
-    model = YOLO("yolov8n.pt")
-    csv_path = os.path.join(session_dir, f"{os.path.splitext(os.path.basename(video_path))[0]}_tracks.csv")
-
-    cap = cv2.VideoCapture(video_path)
-    fgbg = cv2.createBackgroundSubtractorMOG2(history=200, varThreshold=25)
-    frame_idx = 0
-
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["frame", "track_id", "class", "x1", "y1", "x2", "y2"])
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame_idx += 1
-
-            if motion_gate:
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                mask = fgbg.apply(gray)
-                motion = mask.sum()
-                if motion < 20000:
-                    continue  # skip static frames
-
-            results = model.track(frame, persist=True, tracker="bytetrack.yaml", verbose=False)
-            if results and results[0].boxes is not None:
-                boxes = results[0].boxes
-                if boxes.id is not None:
-                    for xyxy, cls, tid in zip(boxes.xyxy, boxes.cls, boxes.id):
-                        x1, y1, x2, y2 = map(int, xyxy)
-                        writer.writerow([frame_idx, int(tid),
-                                         model.names[int(cls)], x1, y1, x2, y2])
     cap.release()
-    print("✅ Tracking finished:", csv_path)
-    return csv_path
+    csv_file.flush()
+    csv_file.close()
+    cv2.destroyAllWindows()
 
+    print("\n✅ Recording complete.")
+    print(f"Video saved to: {os.path.abspath(video_path)}")
+    print(f"Log saved to:   {os.path.abspath(csv_path)}")
 
-def extract_trajectories(csv_path: str, session: str):
-    """Extract dx, dy, speed features from ByteTrack CSV output."""
-    traj_dir = os.path.join(TRAJ_DIR, session)
-    os.makedirs(traj_dir, exist_ok=True)
+    # Automatically open folder
+    subprocess.Popen(r'explorer "C:\Users\Vijaya Sunder\robot_dataset"')
 
-    df = pd.read_csv(csv_path)
-    if df.empty:
-        print("⚠️ No detections found.")
-        return []
-
-    traj_files = []
-    for tid, group in df.groupby("track_id"):
-        group = group.sort_values("frame")
-        group["dx"] = group["x1"].diff().fillna(0)
-        group["dy"] = group["y1"].diff().fillna(0)
-        group["speed"] = np.sqrt(group["dx"]**2 + group["dy"]**2)
-        out_path = os.path.join(traj_dir, f"id{int(tid)}_{os.path.basename(csv_path)}")
-        group.to_csv(out_path, index=False)
-        traj_files.append(out_path)
-    print(f"✅ Extracted {len(traj_files)} trajectories.")
-    return traj_files
-
-
-# Simple Kalman predictor for demonstration
-class Kalman2D:
-    """Basic 2D constant-velocity Kalman Filter for motion prediction."""
-    def __init__(self):
-        self.kf = cv2.KalmanFilter(4, 2)
-        self.kf.transitionMatrix = np.array([[1,0,1,0],
-                                             [0,1,0,1],
-                                             [0,0,1,0],
-                                             [0,0,0,1]], np.float32)
-        self.kf.measurementMatrix = np.eye(2, 4, dtype=np.float32)
-        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 1e-2
-        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1e-1
-        self.state = np.zeros((4,1), np.float32)
-
-    def update(self, x, y):
-        meas = np.array([[np.float32(x)], [np.float32(y)]])
-        self.kf.correct(meas)
-
-    def predict(self):
-        pred = self.kf.predict()
-        return float(pred[0]), float(pred[1])
-
-
-def run_kalman_demo(traj_files):
-    """Visualize Kalman prediction for each trajectory."""
-    for tfile in traj_files:
-        df = pd.read_csv(tfile)
-        if df.empty: continue
-        kf = Kalman2D()
-        preds = []
-        for _, row in df.iterrows():
-            x, y = row["x1"], row["y1"]
-            kf.update(x, y)
-            px, py = kf.predict()
-            preds.append((px, py))
-        pred_df = pd.DataFrame(preds, columns=["x_pred", "y_pred"])
-        out_csv = tfile.replace(".csv", "_predicted.csv")
-        pred_df.to_csv(out_csv, index=False)
-        print("✅ Predicted:", out_csv)
-
-
-# ---------- MAIN PIPELINE ----------
-def main():
-    session = input("Enter session name (e.g., session_01): ").strip()
-    duration = int(input("Clip duration (seconds): ") or 30)
-
-    # Step 1 — Record
-    video_path = record_video(session, duration)
-
-    # Step 2 — Track (with optional motion gating)
-    use_motion = input("Enable motion gating? (y/n): ").lower().startswith('y')
-    track_csv = track_with_bytetrack(video_path, session, motion_gate=use_motion)
-
-    # Step 3 — Extract trajectories
-    traj_files = extract_trajectories(track_csv, session)
-
-    # Step 4 — Kalman predictions
-    run_kalman_demo(traj_files)
-    print("\n🎯 All steps completed for:", session)
-
-
+# ---------- RUN ----------
 if __name__ == "__main__":
     main()
